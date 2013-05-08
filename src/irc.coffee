@@ -190,7 +190,6 @@ class IrcBot extends Adapter
       console.log "From #{from} to #{to}: #{message}"
 
       @getUser to, from, (user) =>
-        console.log user
         if user.room
           console.log "#{to} <#{from}> #{message}"
         else
