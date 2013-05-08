@@ -1,3 +1,6 @@
+# This is a fork of @nandub's hubot-irc that authenticates users via /whois 330s.
+# It has only been tested on freenode.
+
 # Hubot dependencies
 {Robot, Adapter, TextMessage, EnterMessage, LeaveMessage, Response} = require 'hubot'
 
@@ -5,6 +8,10 @@
 Irc = require 'irc'
 
 class IrcBot extends Adapter
+  constructor: ->
+    super
+    @knownUsers = {}
+
   send: (envelope, strings...) ->
     # Use @notice if SEND_NOTICE_MODE is set
     return @notice envelope, strings if process.env.HUBOT_IRC_SEND_NOTICE_MODE?
@@ -13,7 +20,7 @@ class IrcBot extends Adapter
 
     unless target
       return console.log "ERROR: Not sure who to send to. envelope=", envelope
-    
+
     for str in strings
       @bot.say target, str
 
@@ -39,34 +46,57 @@ class IrcBot extends Adapter
 
   reply: (envelope, strings...) ->
     for str in strings
-      @send envelope.user, "#{envelope.user.name}: #{str}"
+      @send envelope.user, "#{envelope.user.nick}: #{str}"
 
   join: (channel) ->
-    self = @
-    @bot.join channel, () ->
+    @bot.join channel, () =>
       console.log('joined %s', channel)
 
-      self.receive new EnterMessage(null)
+      @receive new EnterMessage(null)
 
   part: (channel) ->
-    self = @
-    @bot.part channel, () ->
+    @bot.part channel, () =>
       console.log('left %s', channel)
 
-      self.receive new LeaveMessage(null)
+      @receive new LeaveMessage(null)
 
-  createUser: (channel, from) ->
-      user = @userForName from
-      unless user?
-        id = new Date().getTime().toString()
-        user = @userForId id
-        user.name = from
-
+  getUser: (channel, from, callback = ->) ->
+    user = @knownUsers[""+channel]?[""+from]
+    if user?
       if channel.match(/^[&#]/)
         user.room = channel
       else
         user.room = null
-      user
+      user.nick = from # In case they're logged in more than once
+      callback user
+      return
+    @ircClient.whois from, (details) =>
+      if details.account?.length
+        # They're authenticated with NickServ
+        user = @robot.brain.userForId details.account
+        user.name = details.account
+        user.authenticated = true
+      else
+        # They're not authenticated
+        id = "---"+from
+        user = @robot.brain.userForId id
+        user.name = from
+        user.authenticated = false
+      user.nick = from
+      user.channels ?= []
+
+      if channel.match(/^[&#]/)
+        user.room = channel
+        if user.channels.indexOf(channel) is -1
+          user.channels.push channel
+          # XXX: Remove from channels on part/quit/kill/etc
+      else
+        user.room = null
+
+      @knownUsers[""+channel] ?= {}
+      @knownUsers[""+channel][""+from] = user
+
+      callback user
 
   kick: (channel, client, message) ->
     @bot.emit 'raw',
@@ -86,8 +116,6 @@ class IrcBot extends Adapter
       throw new Error("HUBOT_IRC_SERVER is not defined: try: export HUBOT_IRC_SERVER='irc.myserver.com'")
 
   run: ->
-    self = @
-
     do @checkCanStart
 
     options =
@@ -122,7 +150,7 @@ class IrcBot extends Adapter
     client_options['channels'] = options.rooms unless options.nickpass
 
     @robot.name = options.nick
-    bot = new Irc.Client options.server, options.nick, client_options
+    bot = @ircClient = new Irc.Client options.server, options.nick, client_options
 
     next_id = 1
     user_id = {}
@@ -135,7 +163,7 @@ class IrcBot extends Adapter
 
       identify_args += "#{options.nickpass}"
 
-      bot.addListener 'notice', (from, to, text) ->
+      bot.addListener 'notice', (from, to, text) =>
         if from is 'NickServ' and text.toLowerCase().indexOf('identify') isnt -1
           bot.say 'NickServ', "identify #{identify_args}"
         else if options.nickpass and from is 'NickServ' and
@@ -145,69 +173,95 @@ class IrcBot extends Adapter
             @join room
 
     if options.connectCommand?
-      bot.addListener 'registered', (message) ->
+      bot.addListener 'registered', (message) =>
         # The 'registered' event is fired when you are connected to the server
         strings = options.connectCommand.split " "
-        self.command strings.shift(), strings...
+        @command strings.shift(), strings...
 
-    bot.addListener 'names', (channel, nicks) ->
+    bot.addListener 'names', (channel, nicks) =>
       for nick of nicks
-        self.createUser channel, nick
+        @getUser channel, nick, null
 
-    bot.addListener 'message', (from, to, message) ->
+    bot.addListener 'message', (from, to, message) =>
       if options.nick.toLowerCase() == to.toLowerCase()
         # this is a private message, let the 'pm' listener handle it
         return
 
       console.log "From #{from} to #{to}: #{message}"
 
-      user = self.createUser to, from
-      if user.room
-        console.log "#{to} <#{from}> #{message}"
-      else
-        unless message.indexOf(to) == 0
-          message = "#{to}: #{message}"
-        console.log "msg <#{from}> #{message}"
+      @getUser to, from, (user) =>
+        console.log user
+        if user.room
+          console.log "#{to} <#{from}> #{message}"
+        else
+          unless message.indexOf(to) == 0
+            message = "#{to}: #{message}"
+          console.log "msg <#{from}> #{message}"
 
-      self.receive new TextMessage(user, message)
+        @receive new TextMessage(user, message)
 
-    bot.addListener 'error', (message) ->
+    bot.addListener 'error', (message) =>
       console.error('ERROR: %s: %s', message.command, message.args.join(' '))
 
-    bot.addListener 'pm', (nick, message) ->
+    bot.addListener 'pm', (nick, message) =>
       console.log('Got private message from %s: %s', nick, message)
-      
+
       if process.env.HUBOT_IRC_PRIVATE
         return
 
       nameLength = options.nick.length
+      to = options.nick
       if message.slice(0, nameLength).toLowerCase() != options.nick.toLowerCase()
-        message = "#{options.nick} #{message}"
+        message = "#{to} #{message}"
 
-      self.receive new TextMessage({reply_to: nick, name: nick}, message)
+      @getUser to, nick, (user) =>
+        @receive new TextMessage(user, message)
 
-    bot.addListener 'join', (channel, who) ->
+    bot.addListener 'join', (channel, who) =>
       console.log('%s has joined %s', who, channel)
-      user = self.createUser channel, who
-      self.receive new EnterMessage(user)
+      @getUser channel, who, (user) =>
+        @receive new EnterMessage(user)
 
-    bot.addListener 'part', (channel, who, reason) ->
+    bot.addListener 'part', (channel, who, reason) =>
       console.log('%s has left %s: %s', who, channel, reason)
-      user = self.createUser '', who
-      self.receive new LeaveMessage(user)
+      delete @knownUsers[channel]?[who]
+      @getUser '', who, (user) =>
+        @receive new LeaveMessage(user)
 
-    bot.addListener 'kick', (channel, who, _by, reason) ->
+    bot.addListener 'quit', (who, reason, channels) =>
+      for channel in channels ? []
+        delete @knownUsers[channel]?[who]
+
+    bot.addListener 'nick', (oldNick, newNick, channels, message) =>
+      for channel in channels ? []
+        delete @knownUsers[channel]?[oldNick]
+
+    bot.addListener 'kill', (who, reason, channels) =>
+      for channel in channels ? []
+        delete @knownUsers[channel]?[who]
+
+    bot.addListener 'kick', (channel, who, _by, reason) =>
+      delete @knownUsers[channel]?[who]
       console.log('%s was kicked from %s by %s: %s', who, channel, _by, reason)
 
-    bot.addListener 'invite', (channel, from) ->
+    bot.addListener 'invite', (channel, from) =>
       console.log('%s invite you to join %s', from, channel)
-      
+
       if not process.env.HUBOT_IRC_PRIVATE
         bot.join channel
 
+    bot.addListener 'nick', (channel, who, _by, reason) =>
+      delete @knownUsers[channel]?[who]
+
+    bot.addListener '+mode', (channel, _by, mode, argument, message) =>
+      delete @knownUsers[channel]?[argument]
+
+    bot.addListener '-mode', (channel, _by, mode, argument, message) =>
+      delete @knownUsers[channel]?[argument]
+
     @bot = bot
 
-    self.emit "connected"
+    @emit "connected"
 
   _getTargetFromEnvelope: (envelope) ->
     user = null
@@ -220,16 +274,18 @@ class IrcBot extends Adapter
       user = envelope
     else
       # expand envelope
-      user = envelope.user
+      user = envelope.user ? envelope
       room = envelope.room
+      if user? and not room?
+        return user.nick
 
     if user
       # most common case - we're replying to a user in a room
       if user.room
         target = user.room
       # reply directly
-      else if user.name
-        target = user.name
+      else if user.nick
+        target = user.nick
       # replying to pm
       else if user.reply_to
         target = user.reply_to
