@@ -52,13 +52,13 @@ class IrcBot extends Adapter
     @bot.join channel, () =>
       console.log('joined %s', channel)
 
-      @receive new EnterMessage(null)
+      @receive new EnterMessage({})
 
   part: (channel) ->
     @bot.part channel, () =>
       console.log('left %s', channel)
 
-      @receive new LeaveMessage(null)
+      @receive new LeaveMessage({})
 
   getUser: (channel, from, callback = ->) ->
     user = @knownUsers[""+channel]?[""+from]
